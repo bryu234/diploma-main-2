@@ -6,31 +6,33 @@ INTERVAL="${WATCHDOG_INTERVAL:-30}"
 INITIAL_DELAY="${WATCHDOG_DELAY:-120}"
 MAX_RETRIES="${WATCHDOG_MAX_RETRIES:-5}"
 COMPOSE_FILE="${WATCHDOG_COMPOSE_FILE:-docker-compose.yml}"
+HOST_DIR="${HOST_PROJECT_DIR:-}"
 
 echo "[watchdog] Starting watchdog service"
 echo "[watchdog] Initial delay: ${INITIAL_DELAY}s, Check interval: ${INTERVAL}s, Max retries: ${MAX_RETRIES}"
 
-# Определяем имя проекта и HOST-путь проекта из существующих контейнеров
-detect_compose_info() {
-  # Берём первый контейнер, у которого есть compose-labels
-  SAMPLE=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -v 'watchdog' | grep -v 'nat_cleaner' | head -1)
-  if [ -n "$SAMPLE" ]; then
-    PROJECT_NAME=$(docker inspect "$SAMPLE" --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null || true)
-    HOST_DIR=$(docker inspect "$SAMPLE" --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null || true)
-  fi
-}
-
-sleep "$INITIAL_DELAY"
-
-detect_compose_info
-
-if [ -z "$PROJECT_NAME" ] || [ -z "$HOST_DIR" ]; then
-  echo "[watchdog] ERROR: Could not detect project name or host directory. Exiting."
+if [ -z "$HOST_DIR" ]; then
+  echo "[watchdog] ERROR: HOST_PROJECT_DIR is not set. Set it in .env file."
   exit 1
 fi
 
-echo "[watchdog] Detected project: ${PROJECT_NAME}"
-echo "[watchdog] Detected host dir: ${HOST_DIR}"
+echo "[watchdog] Host project dir: ${HOST_DIR}"
+echo "[watchdog] Compose file: ${COMPOSE_FILE}"
+
+sleep "$INITIAL_DELAY"
+
+# Определяем имя проекта из существующих контейнеров
+PROJECT_NAME=$(docker ps -a --format '{{.Labels}}' 2>/dev/null | \
+  grep -o 'com.docker.compose.project=[^,]*' | \
+  head -1 | cut -d= -f2)
+
+if [ -z "$PROJECT_NAME" ]; then
+  echo "[watchdog] WARNING: Could not detect project name"
+  PROJECT_FLAG=""
+else
+  echo "[watchdog] Detected project: ${PROJECT_NAME}"
+  PROJECT_FLAG="-p ${PROJECT_NAME}"
+fi
 
 # Счётчик попыток перезапуска
 RETRY_DIR="/tmp/watchdog_retries"
@@ -51,16 +53,14 @@ reset_all_retries() {
   rm -f "$RETRY_DIR"/* 2>/dev/null
 }
 
-# Запуск docker compose через временный контейнер с правильными путями
-# Это нужно потому что Docker daemon резолвит volume-пути на ХОСТЕ,
-# и они должны совпадать с тем, что отправляет docker compose.
+# Запуск docker compose через временный контейнер с правильными host-путями
 run_compose() {
   docker run --rm \
     -v /var/run/docker.sock:/var/run/docker.sock \
     -v "$HOST_DIR:$HOST_DIR" \
     -w "$HOST_DIR" \
     docker:cli \
-    docker compose -f "$COMPOSE_FILE" -p "$PROJECT_NAME" "$@" 2>&1
+    docker compose -f "$COMPOSE_FILE" $PROJECT_FLAG "$@" 2>&1
 }
 
 while true; do

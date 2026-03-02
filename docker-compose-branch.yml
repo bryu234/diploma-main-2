@@ -307,6 +307,7 @@ services:
       WATCHDOG_DELAY: 120
       WATCHDOG_MAX_RETRIES: 5
       WATCHDOG_COMPOSE_FILE: docker-compose-branch.yml
+      HOST_PROJECT_DIR: ${HOST_PROJECT_DIR}
     entrypoint: [ "/bin/sh", "/watchdog.sh" ]
     network_mode: none
 
