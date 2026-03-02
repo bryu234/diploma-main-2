@@ -1,15 +1,14 @@
 #!/bin/sh
-# Watchdog: пересоздаёт только упавшие контейнеры.
+# Watchdog: при обнаружении упавших контейнеров делает docker compose down && up
 # Запускает docker compose через временный контейнер с правильными host-путями.
 
 INTERVAL="${WATCHDOG_INTERVAL:-30}"
 INITIAL_DELAY="${WATCHDOG_DELAY:-120}"
-MAX_RETRIES="${WATCHDOG_MAX_RETRIES:-5}"
 COMPOSE_FILE="${WATCHDOG_COMPOSE_FILE:-docker-compose.yml}"
 HOST_DIR="${HOST_PROJECT_DIR:-}"
 
 echo "[watchdog] Starting watchdog service"
-echo "[watchdog] Initial delay: ${INITIAL_DELAY}s, Check interval: ${INTERVAL}s, Max retries: ${MAX_RETRIES}"
+echo "[watchdog] Initial delay: ${INITIAL_DELAY}s, Check interval: ${INTERVAL}s"
 
 if [ -z "$HOST_DIR" ]; then
   echo "[watchdog] ERROR: HOST_PROJECT_DIR is not set. Set it in .env file."
@@ -34,24 +33,7 @@ else
   PROJECT_FLAG="-p ${PROJECT_NAME}"
 fi
 
-# Счётчик попыток перезапуска
-RETRY_DIR="/tmp/watchdog_retries"
-mkdir -p "$RETRY_DIR"
-
-get_retry_count() {
-  file="$RETRY_DIR/$1"
-  if [ -f "$file" ]; then cat "$file"; else echo "0"; fi
-}
-
-increment_retry() {
-  file="$RETRY_DIR/$1"
-  count=$(get_retry_count "$1")
-  echo $((count + 1)) > "$file"
-}
-
-reset_all_retries() {
-  rm -f "$RETRY_DIR"/* 2>/dev/null
-}
+TRIGGERED=false
 
 # Запуск docker compose через временный контейнер с правильными host-путями
 run_compose() {
@@ -73,41 +55,38 @@ while true; do
     grep -v 'nat_cleaner' || true)
 
   if [ -n "$UNHEALTHY" ]; then
-    echo "[watchdog] $(date '+%Y-%m-%d %H:%M:%S') Found unhealthy containers:"
+    FAILED_COUNT=$(echo "$UNHEALTHY" | wc -l | tr -d ' ')
+    echo "[watchdog] $(date '+%Y-%m-%d %H:%M:%S') Found $FAILED_COUNT unhealthy container(s):"
     echo "$UNHEALTHY"
 
-    echo "$UNHEALTHY" | while read -r container_name; do
-      [ -z "$container_name" ] && continue
+    if [ "$TRIGGERED" = "true" ]; then
+      echo "[watchdog] Already triggered restart, skipping this cycle"
+      sleep "$INTERVAL"
+      continue
+    fi
 
-      service_name=$(docker inspect "$container_name" \
-        --format '{{index .Config.Labels "com.docker.compose.service"}}' 2>/dev/null || true)
+    echo "[watchdog] ========================================"
+    echo "[watchdog] Running: docker compose down && up -d"
+    echo "[watchdog] ========================================"
 
-      if [ -z "$service_name" ]; then
-        echo "[watchdog] SKIP $container_name — not a compose service"
-        continue
-      fi
-
-      retries=$(get_retry_count "$service_name")
-      if [ "$retries" -ge "$MAX_RETRIES" ]; then
-        echo "[watchdog] SKIP $service_name — exceeded max retries ($MAX_RETRIES)"
-        continue
-      fi
-
-      echo "[watchdog] Recreating: $service_name (attempt $((retries + 1))/$MAX_RETRIES)"
-
-      # Удаляем старый контейнер
-      docker rm -f "$container_name" 2>/dev/null || true
-
-      # Пересоздаём через временный контейнер с правильными путями
-      run_compose up -d --no-build --no-deps "$service_name" | \
-        while read -r line; do echo "[watchdog][$service_name] $line"; done
-
-      echo "[watchdog] Done: $service_name"
-      increment_retry "$service_name"
-      sleep 5
+    run_compose down --remove-orphans | while read -r line; do
+      echo "[watchdog][down] $line"
     done
+
+    echo "[watchdog] Waiting 10s..."
+    sleep 10
+
+    run_compose up -d --no-build | while read -r line; do
+      echo "[watchdog][up] $line"
+    done
+
+    echo "[watchdog] Done! Waiting ${INITIAL_DELAY}s before next check..."
+    TRIGGERED=true
+    sleep "$INITIAL_DELAY"
+    TRIGGERED=false
   else
-    reset_all_retries
+    echo "[watchdog] $(date '+%Y-%m-%d %H:%M:%S') All containers healthy"
+    TRIGGERED=false
   fi
 
   sleep "$INTERVAL"
