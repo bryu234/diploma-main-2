@@ -1,36 +1,36 @@
 #!/bin/sh
-# Watchdog: пересоздаёт только упавшие контейнеры через docker compose up --force-recreate
-# Не трогает здоровые контейнеры и не убивает себя.
+# Watchdog: пересоздаёт только упавшие контейнеры.
+# Запускает docker compose через временный контейнер с правильными host-путями.
 
 INTERVAL="${WATCHDOG_INTERVAL:-30}"
 INITIAL_DELAY="${WATCHDOG_DELAY:-120}"
 MAX_RETRIES="${WATCHDOG_MAX_RETRIES:-5}"
 COMPOSE_FILE="${WATCHDOG_COMPOSE_FILE:-docker-compose.yml}"
-COMPOSE_DIR="${WATCHDOG_COMPOSE_DIR:-/compose}"
 
 echo "[watchdog] Starting watchdog service"
-echo "[watchdog] Compose file: ${COMPOSE_DIR}/${COMPOSE_FILE}"
 echo "[watchdog] Initial delay: ${INITIAL_DELAY}s, Check interval: ${INTERVAL}s, Max retries: ${MAX_RETRIES}"
 
-# Определяем имя проекта из уже запущенных контейнеров
-# (чтобы compose не путал проект из-за другого имени директории)
-detect_project_name() {
-  docker ps -a --format '{{.Labels}}' 2>/dev/null | \
-    grep -o 'com.docker.compose.project=[^,]*' | \
-    head -1 | cut -d= -f2
+# Определяем имя проекта и HOST-путь проекта из существующих контейнеров
+detect_compose_info() {
+  # Берём первый контейнер, у которого есть compose-labels
+  SAMPLE=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -v 'watchdog' | grep -v 'nat_cleaner' | head -1)
+  if [ -n "$SAMPLE" ]; then
+    PROJECT_NAME=$(docker inspect "$SAMPLE" --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null || true)
+    HOST_DIR=$(docker inspect "$SAMPLE" --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null || true)
+  fi
 }
 
 sleep "$INITIAL_DELAY"
 
-PROJECT_NAME=$(detect_project_name)
-if [ -z "$PROJECT_NAME" ]; then
-  echo "[watchdog] WARNING: Could not detect compose project name, using directory name"
-  PROJECT_NAME=""
-  PROJECT_FLAG=""
-else
-  echo "[watchdog] Detected project name: ${PROJECT_NAME}"
-  PROJECT_FLAG="-p ${PROJECT_NAME}"
+detect_compose_info
+
+if [ -z "$PROJECT_NAME" ] || [ -z "$HOST_DIR" ]; then
+  echo "[watchdog] ERROR: Could not detect project name or host directory. Exiting."
+  exit 1
 fi
+
+echo "[watchdog] Detected project: ${PROJECT_NAME}"
+echo "[watchdog] Detected host dir: ${HOST_DIR}"
 
 # Счётчик попыток перезапуска
 RETRY_DIR="/tmp/watchdog_retries"
@@ -51,6 +51,18 @@ reset_all_retries() {
   rm -f "$RETRY_DIR"/* 2>/dev/null
 }
 
+# Запуск docker compose через временный контейнер с правильными путями
+# Это нужно потому что Docker daemon резолвит volume-пути на ХОСТЕ,
+# и они должны совпадать с тем, что отправляет docker compose.
+run_compose() {
+  docker run --rm \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    -v "$HOST_DIR:$HOST_DIR" \
+    -w "$HOST_DIR" \
+    docker:cli \
+    docker compose -f "$COMPOSE_FILE" -p "$PROJECT_NAME" "$@" 2>&1
+}
+
 while true; do
   # Ищем проблемные контейнеры (кроме watchdog и nat_cleaner)
   UNHEALTHY=$(docker ps -a \
@@ -64,12 +76,9 @@ while true; do
     echo "[watchdog] $(date '+%Y-%m-%d %H:%M:%S') Found unhealthy containers:"
     echo "$UNHEALTHY"
 
-    cd "$COMPOSE_DIR"
-
     echo "$UNHEALTHY" | while read -r container_name; do
       [ -z "$container_name" ] && continue
 
-      # Получаем имя сервиса из Docker Compose labels
       service_name=$(docker inspect "$container_name" \
         --format '{{index .Config.Labels "com.docker.compose.service"}}' 2>/dev/null || true)
 
@@ -86,22 +95,18 @@ while true; do
 
       echo "[watchdog] Recreating: $service_name (attempt $((retries + 1))/$MAX_RETRIES)"
 
-      # Сначала удаляем старый контейнер, затем пересоздаём
-      # --no-build — не пытаться билдить образы (они уже собраны)
+      # Удаляем старый контейнер
       docker rm -f "$container_name" 2>/dev/null || true
 
-      if docker compose -f "$COMPOSE_FILE" $PROJECT_FLAG up -d --no-build --no-deps "$service_name" 2>&1 | \
-          while read -r line; do echo "[watchdog][$service_name] $line"; done; then
-        echo "[watchdog] OK: $service_name recreated"
-      else
-        echo "[watchdog] FAIL: could not recreate $service_name"
-      fi
+      # Пересоздаём через временный контейнер с правильными путями
+      run_compose up -d --no-build --no-deps "$service_name" | \
+        while read -r line; do echo "[watchdog][$service_name] $line"; done
 
+      echo "[watchdog] Done: $service_name"
       increment_retry "$service_name"
       sleep 5
     done
   else
-    # Все контейнеры здоровы — сбрасываем счётчики
     reset_all_retries
   fi
 

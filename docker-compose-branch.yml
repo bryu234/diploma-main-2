@@ -302,12 +302,11 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./watchdog/watchdog.sh:/watchdog.sh:ro
-      - .:/compose:ro
     environment:
       WATCHDOG_INTERVAL: 30
       WATCHDOG_DELAY: 120
+      WATCHDOG_MAX_RETRIES: 5
       WATCHDOG_COMPOSE_FILE: docker-compose-branch.yml
-      WATCHDOG_COMPOSE_DIR: /compose
     entrypoint: [ "/bin/sh", "/watchdog.sh" ]
     network_mode: none
 
