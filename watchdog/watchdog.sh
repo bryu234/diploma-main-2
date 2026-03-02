@@ -11,7 +11,26 @@ COMPOSE_DIR="${WATCHDOG_COMPOSE_DIR:-/compose}"
 echo "[watchdog] Starting watchdog service"
 echo "[watchdog] Compose file: ${COMPOSE_DIR}/${COMPOSE_FILE}"
 echo "[watchdog] Initial delay: ${INITIAL_DELAY}s, Check interval: ${INTERVAL}s, Max retries: ${MAX_RETRIES}"
+
+# Определяем имя проекта из уже запущенных контейнеров
+# (чтобы compose не путал проект из-за другого имени директории)
+detect_project_name() {
+  docker ps -a --format '{{.Labels}}' 2>/dev/null | \
+    grep -o 'com.docker.compose.project=[^,]*' | \
+    head -1 | cut -d= -f2
+}
+
 sleep "$INITIAL_DELAY"
+
+PROJECT_NAME=$(detect_project_name)
+if [ -z "$PROJECT_NAME" ]; then
+  echo "[watchdog] WARNING: Could not detect compose project name, using directory name"
+  PROJECT_NAME=""
+  PROJECT_FLAG=""
+else
+  echo "[watchdog] Detected project name: ${PROJECT_NAME}"
+  PROJECT_FLAG="-p ${PROJECT_NAME}"
+fi
 
 # Счётчик попыток перезапуска
 RETRY_DIR="/tmp/watchdog_retries"
@@ -67,8 +86,11 @@ while true; do
 
       echo "[watchdog] Recreating: $service_name (attempt $((retries + 1))/$MAX_RETRIES)"
 
-      # force-recreate пересоздаёт контейнер + сеть, не трогая остальные сервисы
-      if docker compose -f "$COMPOSE_FILE" up -d --force-recreate "$service_name" 2>&1 | \
+      # Сначала удаляем старый контейнер, затем пересоздаём
+      # --no-build — не пытаться билдить образы (они уже собраны)
+      docker rm -f "$container_name" 2>/dev/null || true
+
+      if docker compose -f "$COMPOSE_FILE" $PROJECT_FLAG up -d --no-build --no-deps "$service_name" 2>&1 | \
           while read -r line; do echo "[watchdog][$service_name] $line"; done; then
         echo "[watchdog] OK: $service_name recreated"
       else
