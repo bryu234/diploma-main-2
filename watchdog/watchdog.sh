@@ -1,6 +1,7 @@
 #!/bin/sh
 # Watchdog: при обнаружении упавших контейнеров делает docker compose down && up
-# Запускает docker compose через временный контейнер с правильными host-путями.
+# ВАЖНО: down и up выполняются в ОДНОМ helper-контейнере,
+# который не является частью compose-проекта и поэтому переживёт down.
 
 INTERVAL="${WATCHDOG_INTERVAL:-30}"
 INITIAL_DELAY="${WATCHDOG_DELAY:-120}"
@@ -33,18 +34,6 @@ else
   PROJECT_FLAG="-p ${PROJECT_NAME}"
 fi
 
-TRIGGERED=false
-
-# Запуск docker compose через временный контейнер с правильными host-путями
-run_compose() {
-  docker run --rm \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    -v "$HOST_DIR:$HOST_DIR" \
-    -w "$HOST_DIR" \
-    docker:cli \
-    docker compose -f "$COMPOSE_FILE" $PROJECT_FLAG "$@" 2>&1
-}
-
 while true; do
   # Ищем проблемные контейнеры (кроме watchdog и nat_cleaner)
   UNHEALTHY=$(docker ps -a \
@@ -58,35 +47,36 @@ while true; do
     FAILED_COUNT=$(echo "$UNHEALTHY" | wc -l | tr -d ' ')
     echo "[watchdog] $(date '+%Y-%m-%d %H:%M:%S') Found $FAILED_COUNT unhealthy container(s):"
     echo "$UNHEALTHY"
-
-    if [ "$TRIGGERED" = "true" ]; then
-      echo "[watchdog] Already triggered restart, skipping this cycle"
-      sleep "$INTERVAL"
-      continue
-    fi
-
     echo "[watchdog] ========================================"
-    echo "[watchdog] Running: docker compose down && up -d"
+    echo "[watchdog] Launching helper: down && sleep 10 && up"
     echo "[watchdog] ========================================"
 
-    run_compose down --remove-orphans | while read -r line; do
-      echo "[watchdog][down] $line"
-    done
+    # Запускаем down+up в ОДНОМ helper-контейнере.
+    # Helper НЕ часть compose-проекта → переживёт docker compose down.
+    # Даже после того как watchdog будет убит, helper доведёт up до конца,
+    # и watchdog поднимется снова вместе с остальными контейнерами.
+    docker run --rm \
+      --name watchdog_helper \
+      -v /var/run/docker.sock:/var/run/docker.sock \
+      -v "$HOST_DIR:$HOST_DIR" \
+      -w "$HOST_DIR" \
+      docker:cli \
+      sh -c "
+        echo '[helper] Running docker compose down...'
+        docker compose -f $COMPOSE_FILE $PROJECT_FLAG down --remove-orphans
+        echo '[helper] Waiting 10s...'
+        sleep 10
+        echo '[helper] Running docker compose up -d...'
+        docker compose -f $COMPOSE_FILE $PROJECT_FLAG up -d --no-build
+        echo '[helper] Done!'
+      " 2>&1 | while read -r line; do echo "[watchdog] $line"; done
 
-    echo "[watchdog] Waiting 10s..."
-    sleep 10
-
-    run_compose up -d --no-build | while read -r line; do
-      echo "[watchdog][up] $line"
-    done
-
-    echo "[watchdog] Done! Waiting ${INITIAL_DELAY}s before next check..."
-    TRIGGERED=true
+    # Если мы дошли сюда — значит watchdog не был убит (маловероятно).
+    # На всякий случай ждём перед следующей проверкой.
+    echo "[watchdog] Helper finished. Waiting ${INITIAL_DELAY}s..."
     sleep "$INITIAL_DELAY"
-    TRIGGERED=false
   else
     echo "[watchdog] $(date '+%Y-%m-%d %H:%M:%S') All containers healthy"
-    TRIGGERED=false
   fi
 
   sleep "$INTERVAL"
